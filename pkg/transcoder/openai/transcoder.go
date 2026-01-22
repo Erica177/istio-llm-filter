@@ -21,7 +21,7 @@ import (
 	"fmt"
 
 	"github.com/bytedance/sonic"
-	"mosn.io/htnn/api/pkg/filtermanager/api"
+	"github.com/envoyproxy/envoy/contrib/golang/common/go/api"
 
 	"github.com/istio-llm-filter/pkg/config"
 	"github.com/istio-llm-filter/pkg/transcoder"

@@ -20,9 +20,7 @@ import (
 	"fmt"
 	"sort"
 
-	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/known/structpb"
-	"mosn.io/htnn/api/pkg/filtermanager/api"
+	"github.com/envoyproxy/envoy/contrib/golang/common/go/api"
 
 	"github.com/istio-llm-filter/pkg/types"
 )
@@ -185,26 +183,6 @@ type LLMProxyConfig struct {
 	LbMappingConfigs map[string]*LBConfig
 	// MC Metadata-Center 客户端
 	MC types.MetadataCenter
-	// protoStruct 用于满足 PluginConfig 接口的 proto 结构
-	protoStruct *structpb.Struct
-}
-
-// ProtoReflect 实现 api.PluginConfig 接口
-// 返回一个空的 protoreflect.Message 用于满足接口要求
-func (c *LLMProxyConfig) ProtoReflect() protoreflect.Message {
-	if c.protoStruct == nil {
-		c.protoStruct = &structpb.Struct{}
-	}
-	return c.protoStruct.ProtoReflect()
-}
-
-// Validate 实现 api.PluginConfig 接口
-// 验证配置的有效性
-func (c *LLMProxyConfig) Validate() error {
-	if c.Protocol == "" {
-		return errors.New("protocol is required")
-	}
-	return nil
 }
 
 // buildModelMappings 构建模型映射
@@ -230,7 +208,7 @@ func buildModelMappings(mappingRules map[string]*Rules) map[string]*Mapping {
 }
 
 // Init 初始化配置
-func (c *LLMProxyConfig) Init(cb api.ConfigCallbackHandler) error {
+func (c *LLMProxyConfig) Init() error {
 	mappingRules := c.GetModelMappingRule()
 	if len(mappingRules) > 0 {
 		c.ModelMappings = buildModelMappings(mappingRules)
@@ -281,7 +259,12 @@ func validateRules(rules []*Rule) (string, string, error) {
 }
 
 // Parse 解析并验证配置
-func (c *LLMProxyConfig) Parse(cb api.ConfigCallbackHandler) error {
+func (c *LLMProxyConfig) Parse() error {
+	// 验证配置
+	if c.Protocol == "" {
+		return errors.New("protocol is required")
+	}
+
 	mappingRules := c.GetModelMappingRule()
 	if len(mappingRules) > 0 {
 		for key, rule := range mappingRules {

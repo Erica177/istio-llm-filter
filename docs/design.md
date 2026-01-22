@@ -106,7 +106,7 @@ flowchart TB
 
 | 组件 | 职责 | 技术选型 | 说明 |
 |------|------|----------|------|
-| **LLM Proxy Filter** | 请求解析、路由、转码、负载均衡 | Envoy Golang Filter + HTNN 框架 | 核心组件，实现所有智能路由逻辑 |
+| **LLM Proxy Filter** | 请求解析、路由、转码、负载均衡 | Envoy Golang Filter | 核心组件，实现所有智能路由逻辑 |
 | **Metadata-Center** | 统计负载数据、存储 KV-Cache 位置 | HTTP Server + 内存存储 | 可选组件，不启用时退化为随机路由 |
 | **Istio Gateway** | 流量入口、TLS 终止、路由分发 | Envoy + Istio 配置 | 复用 Istio 基础设施 |
 | **推理服务** | 执行 LLM 推理、管理 KV-Cache | vLLM / SGLang / TensorRT-LLM | 不需要修改，保持原生 OpenAI 兼容 API |
@@ -414,35 +414,37 @@ flowchart TB
 
 #### 职责
 
-Filter 模块是整个插件的核心，负责处理请求/响应的完整生命周期。它实现了 HTNN 框架的 `PassThroughFilter` 接口，在 Envoy 的 HTTP 处理链中执行智能路由逻辑。
+Filter 模块是整个插件的核心，负责处理请求/响应的完整生命周期。它实现了 Envoy 原生的 `StreamFilter` 接口（通过嵌入 `PassThroughStreamFilter`），在 Envoy 的 HTTP 处理链中执行智能路由逻辑。
 
 #### 类图
 
 ```mermaid
 classDiagram
     class Filter {
+        -PassThroughStreamFilter
         -callbacks FilterCallbackHandler
         -config *LLMProxyConfig
         -traceId string
         -modelName string
         -cluster string
         -serverIp string
-        -promptHash []string
+        -promptHash []uint64
         -transcoder Transcoder
         -isStream bool
-        -firstTokenReceived bool
-        -requestStartTime time.Time
-        -firstTokenTime time.Time
-        +DecodeHeaders(headers, endStream) ResultAction
-        +DecodeRequest(headers, data, trailers) ResultAction
-        +EncodeHeaders(headers, endStream) ResultAction
-        +EncodeData(data, endStream) ResultAction
-        +EncodeResponse(headers, data, trailers) ResultAction
-        +OnLog()
-        -badRequest(err) ResultAction
-        -noUpstream(err) ResultAction
-        -badResponse(err) ResultAction
+        -firstTokenTimestamp int64
+        -sendFinishTimestamp time.Time
+        +DecodeHeaders(headers, endStream) StatusType
+        +DecodeData(buffer, endStream) StatusType
+        +DecodeTrailers(trailers) StatusType
+        +EncodeHeaders(headers, endStream) StatusType
+        +EncodeData(buffer, endStream) StatusType
+        +EncodeTrailers(trailers) StatusType
+        +OnDestroy(reason)
+        -badRequest(err)
+        -noUpstream(err)
+        -badResponse(err)
         -initLoadBalanceContext() context
+        -processRequest() StatusType
         -addRequest()
         -deletePromptLength()
         -decreaseRequest()
@@ -450,11 +452,24 @@ classDiagram
         -getTTFT() Duration
     }
     
-    class PassThroughFilter {
+    class PassThroughStreamFilter {
         <<interface>>
     }
     
-    Filter --|> PassThroughFilter
+    class StreamFilter {
+        <<interface>>
+        +DecodeHeaders()
+        +DecodeData()
+        +DecodeTrailers()
+        +EncodeHeaders()
+        +EncodeData()
+        +EncodeTrailers()
+        +OnLog()
+        +OnDestroy()
+    }
+    
+    Filter --|> PassThroughStreamFilter
+    PassThroughStreamFilter ..|> StreamFilter
 ```
 
 #### 关键字段说明
@@ -478,14 +493,15 @@ classDiagram
 
 | 方法 | 调用时机 | 返回值 | 处理逻辑 |
 |------|----------|--------|----------|
-| `DecodeHeaders` | 收到请求头 | `WaitAllData` | 返回等待完整请求体的信号 |
-| `DecodeRequest` | 收到完整请求 | `Continue` / `LocalResponse` | 核心处理：解析、路由、转码、选后端 |
-| `EncodeHeaders` | 收到响应头 | `Continue` / `WaitAllData` | 保存 Cache 位置，判断流式/非流式 |
-| `EncodeData` | 收到流式数据块 | `Continue` | 转码响应块，检测首 Token |
-| `EncodeResponse` | 收到完整响应 | `Continue` | 转码完整响应体 |
-| `OnLog` | 请求结束 | - | 清理统计数据，记录访问日志 |
+| `DecodeHeaders` | 收到请求头 | `StopAndBuffer` | 缓存请求头，返回等待完整请求体的信号 |
+| `DecodeData` | 收到请求体数据 | `Continue` / `LocalReply` | 完整请求体到达时调用 processRequest 处理 |
+| `DecodeTrailers` | 收到请求尾部 | `Continue` | 通常不处理 |
+| `EncodeHeaders` | 收到响应头 | `Continue` / `StopAndBuffer` | 保存 Cache 位置，判断流式/非流式 |
+| `EncodeData` | 收到响应体数据 | `Continue` | 转码响应块，检测首 Token |
+| `EncodeTrailers` | 收到响应尾部 | `Continue` | 通常不处理 |
+| `OnDestroy` | 请求结束 | - | 清理统计数据，记录访问日志 |
 
-#### DecodeRequest 处理流程
+#### processRequest 处理流程
 
 ```mermaid
 flowchart TB
@@ -857,11 +873,9 @@ classDiagram
         +ModelMappings map[string]*Mapping
         +LbMappingConfigs map[string]*LBConfig
         +MC MetadataCenter
-        +Init(cb) error
-        +Parse(cb) error
+        +Init() error
+        +Parse() error
         +FindLbMappingRule(model) *LBConfig
-        +ProtoReflect() Message
-        +Validate() error
     }
     
     class Rules {
@@ -1149,35 +1163,32 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.golang.v3alpha.Config
             library_id: llm-proxy
             library_path: /etc/envoy/libllmproxy.so
-            plugin_name: fm
+            plugin_name: llm-proxy
             plugin_config:
               "@type": type.googleapis.com/xds.type.v3.TypedStruct
               value:
-                plugins:
-                  - name: llm-proxy
-                    config:
-                      protocol: openai
-                      algorithm: inference_lb
-                      model_mapping_rule:
-                        qwen-2.5-72b:
-                          rules:
-                            - scene_name: qwen-prod
-                              cluster: outbound|8000||vllm-service.llm.svc.cluster.local
-                              backend: vllm
-                              headers:
-                                - key: x-env
-                                  value: prod
-                            - scene_name: qwen-default
-                              cluster: outbound|8000||vllm-service.llm.svc.cluster.local
-                              backend: vllm
-                      lb_mapping_rule:
-                        qwen-2.5-72b:
-                          load_aware_enable: true
-                          cache_aware_enable: true
-                          candidate_percent: 10
-                          request_load_weight: 1
-                          prefill_load_weight: 3
-                          cache_radio_weight: 2
+                protocol: openai
+                algorithm: inference_lb
+                model_mapping_rule:
+                  qwen-2.5-72b:
+                    rules:
+                      - scene_name: qwen-prod
+                        cluster: outbound|8000||vllm-service.llm.svc.cluster.local
+                        backend: vllm
+                        headers:
+                          - key: x-env
+                            value: prod
+                      - scene_name: qwen-default
+                        cluster: outbound|8000||vllm-service.llm.svc.cluster.local
+                        backend: vllm
+                lb_mapping_rule:
+                  qwen-2.5-72b:
+                    load_aware_enable: true
+                    cache_aware_enable: true
+                    candidate_percent: 10
+                    request_load_weight: 1
+                    prefill_load_weight: 3
+                    cache_radio_weight: 2
 ```
 
 **配置说明**：
@@ -1185,8 +1196,10 @@ spec:
 - `workloadSelector`：选择要注入 Filter 的工作负载，这里选择 Istio Ingress Gateway
 - `applyTo: HTTP_FILTER`：在 HTTP Filter 链中注入
 - `INSERT_BEFORE router`：在 Router Filter 之前执行，确保能修改路由目标
+- `library_id`：库标识符，用于 Envoy 内部缓存
 - `library_path`：Filter `.so` 文件的路径，需要通过 Volume 挂载到容器中
-- `plugin_name: fm`：使用 FilterManager 管理插件
+- `plugin_name`：插件名称，必须与 Go 代码中通过 `RegisterHttpFilterFactoryAndConfigParser` 注册的名称一致
+- `plugin_config`：使用 `TypedStruct` 包装的 JSON 配置，会被解析为 `*anypb.Any` 传递给 ConfigParser
 - `model_mapping_rule`：按模型名配置路由规则，支持 Header 条件匹配
 - `lb_mapping_rule`：按模型名配置负载均衡参数
 
@@ -1365,7 +1378,8 @@ Filter 在关键节点输出结构化日志，便于问题排查和性能分析�
 ### 9.2 参考文档
 
 - [Envoy Golang Filter 文档](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/golang_filter)
-- [HTNN Filter 框架](https://github.com/mosn/htnn)
+- [Envoy Golang Filter Proto 定义](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/golang/v3alpha/golang.proto)
+- [Envoy Go SDK 源码](https://github.com/envoyproxy/envoy/tree/main/contrib/golang)
 - [vLLM 文档](https://docs.vllm.ai/)
 - [Istio EnvoyFilter 配置](https://istio.io/latest/docs/reference/config/networking/envoy-filter/)
 - [OpenAI API 规范](https://platform.openai.com/docs/api-reference)

@@ -131,8 +131,8 @@ type EndpointStatsWrapper struct {
 	CacheStats    *EndpointCacheStats
 
 	// 归一化后的负载值
-	RequestLoad float64
-	PrefillLoad float64
+	RequestLoad  float64
+	PrefillLoad  float64
 	CacheHitRate float64
 
 	// 综合评分

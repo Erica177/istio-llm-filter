@@ -56,17 +56,17 @@ const (
 
 // 环境变量名称
 const (
-	EnvMetadataCenterHost    = "METADATA_CENTER_HOST"
-	EnvMetadataCenterPort    = "METADATA_CENTER_PORT"
-	EnvFetchMetricTimeout    = "METADATA_CENTER_FETCH_METRIC_TIMEOUT"
-	EnvFetchCacheTimeout     = "METADATA_CENTER_FETCH_CACHE_TIMEOUT"
-	EnvUpdateStatsTimeout    = "METADATA_CENTER_UPDATE_STATS_TIMEOUT"
-	EnvClientTimeout         = "METADATA_CENTER_CLIENT_TIMEOUT"
-	EnvClientMaxIdleConns    = "METADATA_CENTER_CLIENT_MAX_IDLE_CONNS"
-	EnvClientKeepAlive       = "METADATA_CENTER_CLIENT_KEEPALIVE"
-	EnvQueueSize             = "METADATA_CENTER_QUEUE_SIZE"
-	EnvWorkerCount           = "METADATA_CENTER_WORKER_COUNT"
-	EnvMaxFailoverRetry      = "METADATA_CENTER_MAX_FAILOVER_RETRY"
+	EnvMetadataCenterHost = "METADATA_CENTER_HOST"
+	EnvMetadataCenterPort = "METADATA_CENTER_PORT"
+	EnvFetchMetricTimeout = "METADATA_CENTER_FETCH_METRIC_TIMEOUT"
+	EnvFetchCacheTimeout  = "METADATA_CENTER_FETCH_CACHE_TIMEOUT"
+	EnvUpdateStatsTimeout = "METADATA_CENTER_UPDATE_STATS_TIMEOUT"
+	EnvClientTimeout      = "METADATA_CENTER_CLIENT_TIMEOUT"
+	EnvClientMaxIdleConns = "METADATA_CENTER_CLIENT_MAX_IDLE_CONNS"
+	EnvClientKeepAlive    = "METADATA_CENTER_CLIENT_KEEPALIVE"
+	EnvQueueSize          = "METADATA_CENTER_QUEUE_SIZE"
+	EnvWorkerCount        = "METADATA_CENTER_WORKER_COUNT"
+	EnvMaxFailoverRetry   = "METADATA_CENTER_MAX_FAILOVER_RETRY"
 )
 
 // Context 键
@@ -88,8 +88,8 @@ var (
 	fetchCacheTimeoutOnce  sync.Once
 
 	// 是否启用 metadata center
-	metadataCenterEnabled     bool
-	metadataCenterEnabledOnce sync.Once
+	metadataCenterEnabled          bool
+	metadataCenterEnabledOnce      sync.Once
 	metadataCenterCacheEnabled     bool
 	metadataCenterCacheEnabledOnce sync.Once
 )

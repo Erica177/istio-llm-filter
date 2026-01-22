@@ -22,8 +22,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/envoyproxy/envoy/contrib/golang/common/go/api"
 	"github.com/google/uuid"
-	"mosn.io/htnn/api/pkg/filtermanager/api"
 
 	"github.com/istio-llm-filter/pkg/config"
 	"github.com/istio-llm-filter/pkg/hash"
@@ -40,10 +40,17 @@ const Name = "llm-proxy"
 var hostname = os.Getenv("HOSTNAME")
 
 // Filter LLM Proxy 过滤器
+// 实现 api.StreamFilter 接口
 type Filter struct {
-	api.PassThroughFilter
+	// 嵌入 PassThroughStreamFilter 提供默认实现
+	api.PassThroughStreamFilter
+
 	callbacks api.FilterCallbackHandler
 	config    *config.LLMProxyConfig
+
+	// 请求头和请求体缓存
+	reqHeaders api.RequestHeaderMap
+	reqBuffer  api.BufferInstance
 
 	// 转码器
 	transcoder transcoder.Transcoder
@@ -83,33 +90,59 @@ func (f *Filter) UniqueId() string {
 }
 
 // DecodeHeaders 处理请求头
-// 返回 WaitAllData 等待完整请求体
-func (f *Filter) DecodeHeaders(header api.RequestHeaderMap, endStream bool) api.ResultAction {
+// 缓存请求头，等待完整请求体
+func (f *Filter) DecodeHeaders(header api.RequestHeaderMap, endStream bool) api.StatusType {
+	f.reqHeaders = header
+
 	if endStream {
 		// 没有请求体，返回错误
-		return f.badRequest(fmt.Errorf("no request body"))
+		f.badRequest(fmt.Errorf("no request body"))
+		return api.LocalReply
 	}
-	return api.WaitAllData
+
+	// 等待完整请求体
+	return api.StopAndBuffer
 }
 
-// DecodeRequest 处理完整请求
+// DecodeData 处理请求体
+func (f *Filter) DecodeData(buffer api.BufferInstance, endStream bool) api.StatusType {
+	if !endStream {
+		// 继续缓存数据
+		return api.StopAndBuffer
+	}
+
+	f.reqBuffer = buffer
+	return f.processRequest()
+}
+
+// DecodeTrailers 处理请求尾部
+func (f *Filter) DecodeTrailers(trailers api.RequestTrailerMap) api.StatusType {
+	return api.Continue
+}
+
+// processRequest 处理完整请求
 // 这是请求处理的核心逻辑
-func (f *Filter) DecodeRequest(headers api.RequestHeaderMap, buffer api.BufferInstance, trailers api.RequestTrailerMap) api.ResultAction {
+func (f *Filter) processRequest() api.StatusType {
+	headers := f.reqHeaders
+	buffer := f.reqBuffer
+
 	// 1. 获取 Trace ID
-	f.traceId = getTraceID(f.callbacks, headers)
+	f.traceId = getTraceID(headers)
 
 	// 2. 获取转码器
 	inputProtocol := f.config.GetProtocol()
 	factory := transcoder.GetFactory(inputProtocol)
 	if factory == nil {
-		return f.badRequest(fmt.Errorf("transcoder not found for protocol %s", inputProtocol))
+		f.badRequest(fmt.Errorf("transcoder not found for protocol %s", inputProtocol))
+		return api.LocalReply
 	}
 	f.transcoder = factory(f.callbacks, f.config)
 
 	// 3. 解析请求数据
 	reqData, err := f.transcoder.GetRequestData(headers, buffer.Bytes())
 	if err != nil {
-		return f.badRequest(err)
+		f.badRequest(err)
+		return api.LocalReply
 	}
 
 	// 4. 提取请求信息
@@ -130,13 +163,15 @@ func (f *Filter) DecodeRequest(headers api.RequestHeaderMap, buffer api.BufferIn
 	algorithm := types.LoadBalancerType(f.config.GetAlgorithm())
 	hosts := f.getClusterHosts()
 	if len(hosts) == 0 {
-		return f.noUpstream(fmt.Errorf("no hosts in cluster %s", f.cluster))
+		f.noUpstream(fmt.Errorf("no hosts in cluster %s", f.cluster))
+		return api.LocalReply
 	}
 
 	host, err := loadbalancer.ChooseServer(ctx, f.cluster, algorithm, hosts)
 	if err != nil {
 		api.LogErrorf("[TraceID: %s] choose server failed: %v", f.traceId, err)
-		return f.noUpstream(err)
+		f.noUpstream(err)
+		return api.LocalReply
 	}
 
 	f.serverIp = host.Ip()
@@ -151,7 +186,8 @@ func (f *Filter) DecodeRequest(headers api.RequestHeaderMap, buffer api.BufferIn
 
 	reqCtx, err := f.transcoder.EncodeRequest(proxyModelName, f.backendProtocol, headers, buffer)
 	if err != nil {
-		return f.badRequest(err)
+		f.badRequest(err)
+		return api.LocalReply
 	}
 
 	f.isStream = reqCtx.IsStream
@@ -162,14 +198,14 @@ func (f *Filter) DecodeRequest(headers api.RequestHeaderMap, buffer api.BufferIn
 	// 10. 记录发送完成时间
 	f.sendFinishTimestamp = time.Now().UnixMicro()
 
-	// 11. 设置上游主机（通过 Dynamic Metadata 或直接设置）
+	// 11. 设置上游主机
 	f.setUpstreamHost(headers, host)
 
 	return api.Continue
 }
 
 // EncodeHeaders 处理响应头
-func (f *Filter) EncodeHeaders(header api.ResponseHeaderMap, endStream bool) api.ResultAction {
+func (f *Filter) EncodeHeaders(header api.ResponseHeaderMap, endStream bool) api.StatusType {
 	// 添加通用响应头
 	if hostname != "" {
 		header.Add("x-llm-proxy-via", hostname)
@@ -177,21 +213,25 @@ func (f *Filter) EncodeHeaders(header api.ResponseHeaderMap, endStream bool) api
 
 	status, _ := header.Status()
 	if status >= http.StatusBadRequest {
-		// 错误响应，等待完整响应体
+		// 错误响应，记录日志
 		api.LogInfof("[TraceID: %s] error response status=%d", f.traceId, status)
-		return api.WaitAllData
+		return api.Continue
 	}
 
 	// 保存 KV-Cache（仅 200 响应）
 	f.saveKVCache()
 
 	// 解码响应头
-	if err := f.transcoder.DecodeHeaders(header); err != nil {
-		return f.badResponse(err)
+	if f.transcoder != nil {
+		if err := f.transcoder.DecodeHeaders(header); err != nil {
+			f.badResponse(err)
+			return api.LocalReply
+		}
 	}
 
 	if endStream {
-		return f.badResponse(fmt.Errorf("no response data"))
+		f.badResponse(fmt.Errorf("no response data"))
+		return api.LocalReply
 	}
 
 	if f.isStream {
@@ -199,42 +239,43 @@ func (f *Filter) EncodeHeaders(header api.ResponseHeaderMap, endStream bool) api
 		header.Set("content-type", "text/event-stream;charset=UTF-8")
 		header.Set("x-accel-buffering", "no")
 		f.respHeader = header
-		return api.WaitData
+		return api.Continue
 	}
 
 	// 非流式响应
 	header.Set("content-type", "application/json")
-	return api.WaitAllData
+	f.respHeader = header
+	return api.StopAndBuffer
 }
 
-// EncodeResponse 处理非流式完整响应
-func (f *Filter) EncodeResponse(headers api.ResponseHeaderMap, buffer api.BufferInstance, trailers api.ResponseTrailerMap) api.ResultAction {
-	// 删除 Prompt 长度
-	f.deletePromptLength()
-
-	status, _ := headers.Status()
-	if status >= http.StatusBadRequest {
-		// 错误响应，保留原样
-		api.LogWarnf("[TraceID: %s] error response status=%d, body=%s",
-			f.traceId, status, buffer.String())
-		return api.Continue
-	}
-
-	return f.processResponseData(headers, buffer)
-}
-
-// EncodeData 处理流式响应数据
-func (f *Filter) EncodeData(buffer api.BufferInstance, endStream bool) api.ResultAction {
+// EncodeData 处理响应数据
+func (f *Filter) EncodeData(buffer api.BufferInstance, endStream bool) api.StatusType {
 	// 记录首 Token 时间
 	f.recordTokenTime()
+
+	if f.isStream {
+		// 流式响应，逐块处理
+		return f.processResponseData(f.respHeader, buffer)
+	}
+
+	if !endStream {
+		// 非流式响应，继续缓存
+		return api.StopAndBuffer
+	}
+
+	// 删除 Prompt 长度
+	f.deletePromptLength()
 
 	return f.processResponseData(f.respHeader, buffer)
 }
 
-// OnLog 请求完成回调
-func (f *Filter) OnLog(reqHeaders api.RequestHeaderMap, reqTrailers api.RequestTrailerMap,
-	respHeaders api.ResponseHeaderMap, respTrailers api.ResponseTrailerMap) {
+// EncodeTrailers 处理响应尾部
+func (f *Filter) EncodeTrailers(trailers api.ResponseTrailerMap) api.StatusType {
+	return api.Continue
+}
 
+// OnDestroy 请求销毁回调
+func (f *Filter) OnDestroy(reason api.DestroyReason) {
 	// 删除请求统计
 	if f.isIncreaseRecorded {
 		f.decreaseRequest()
@@ -242,43 +283,34 @@ func (f *Filter) OnLog(reqHeaders api.RequestHeaderMap, reqTrailers api.RequestT
 
 	// 记录日志指标
 	ttft := f.getTTFT()
-	api.LogInfof("[TraceID: %s] request completed: model=%s, backend=%s, ttft=%dms",
-		f.traceId, f.modelName, f.serverIp, ttft.Milliseconds())
+	api.LogInfof("[TraceID: %s] request completed: model=%s, backend=%s, ttft=%dms, reason=%d",
+		f.traceId, f.modelName, f.serverIp, ttft.Milliseconds(), reason)
 }
 
 // 内部方法
 
-func (f *Filter) badRequest(err error) api.ResultAction {
+func (f *Filter) badRequest(err error) {
 	api.LogInfof("[TraceID: %s] bad request: %v", f.traceId, err)
-	hdr := http.Header{}
-	hdr.Set("Content-Type", "application/json")
-	return &api.LocalResponse{
-		Code:   http.StatusBadRequest,
-		Msg:    string(types.FormatGatewayResponse(&types.ErrBadRequest, f.traceId, err.Error())),
-		Header: hdr,
-	}
+	body := types.FormatGatewayResponse(&types.ErrBadRequest, f.traceId, err.Error())
+	f.callbacks.DecoderFilterCallbacks().SendLocalReply(http.StatusBadRequest, string(body), map[string][]string{
+		"content-type": {"application/json"},
+	}, 0, "bad_request")
 }
 
-func (f *Filter) noUpstream(err error) api.ResultAction {
+func (f *Filter) noUpstream(err error) {
 	api.LogInfof("[TraceID: %s] no upstream: %v", f.traceId, err)
-	hdr := http.Header{}
-	hdr.Set("Content-Type", "application/json")
-	return &api.LocalResponse{
-		Code:   http.StatusNotFound,
-		Msg:    string(types.FormatGatewayResponse(&types.ErrNotFound, f.traceId, err.Error())),
-		Header: hdr,
-	}
+	body := types.FormatGatewayResponse(&types.ErrNotFound, f.traceId, err.Error())
+	f.callbacks.DecoderFilterCallbacks().SendLocalReply(http.StatusNotFound, string(body), map[string][]string{
+		"content-type": {"application/json"},
+	}, 0, "no_upstream")
 }
 
-func (f *Filter) badResponse(err error) api.ResultAction {
+func (f *Filter) badResponse(err error) {
 	api.LogInfof("[TraceID: %s] bad response: %v", f.traceId, err)
-	hdr := http.Header{}
-	hdr.Set("Content-Type", "application/json")
-	return &api.LocalResponse{
-		Code:   http.StatusServiceUnavailable,
-		Msg:    string(types.FormatGatewayResponse(&types.ErrInferenceServer, f.traceId, err.Error())),
-		Header: hdr,
-	}
+	body := types.FormatGatewayResponse(&types.ErrInferenceServer, f.traceId, err.Error())
+	f.callbacks.EncoderFilterCallbacks().SendLocalReply(http.StatusServiceUnavailable, string(body), map[string][]string{
+		"content-type": {"application/json"},
+	}, 0, "bad_response")
 }
 
 func (f *Filter) initLoadBalanceContext() context.Context {
@@ -341,9 +373,13 @@ func (f *Filter) setUpstreamHost(headers api.RequestHeaderMap, host types.Host) 
 	}
 }
 
-func (f *Filter) processResponseData(headers api.ResponseHeaderMap, buffer api.BufferInstance) api.ResultAction {
+func (f *Filter) processResponseData(headers api.ResponseHeaderMap, buffer api.BufferInstance) api.StatusType {
 	if f.dropRespData {
 		buffer.Reset()
+		return api.Continue
+	}
+
+	if f.transcoder == nil {
 		return api.Continue
 	}
 
@@ -494,7 +530,7 @@ func (f *Filter) saveKVCache() {
 
 // 辅助函数
 
-func getTraceID(callbacks api.FilterCallbackHandler, headers api.RequestHeaderMap) string {
+func getTraceID(headers api.RequestHeaderMap) string {
 	// 尝试从请求头获取
 	if traceId, ok := headers.Get("x-request-id"); ok && traceId != "" {
 		return traceId

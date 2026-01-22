@@ -20,24 +20,21 @@ package main
 
 import (
 	"github.com/envoyproxy/envoy/contrib/golang/filters/http/source/go/pkg/http"
-	"mosn.io/htnn/api/pkg/filtermanager"
 
 	// 导入以注册相关组件
-	// filter 包的 init() 会自动注册 llm-proxy 插件到 filtermanager
-	_ "github.com/istio-llm-filter/pkg/filter"
+	"github.com/istio-llm-filter/pkg/filter"
 	_ "github.com/istio-llm-filter/pkg/loadbalancer"
 	_ "github.com/istio-llm-filter/pkg/metadata"
 	_ "github.com/istio-llm-filter/pkg/transcoder/openai"
 )
 
 func init() {
-	// 注册 Filter Manager
-	// fm: Filter Manager，管理多个插件的执行
-	// 所有通过 plugins.RegisterPlugin 注册的插件都会由 fm 统一管理
+	// 直接注册 LLM Proxy Filter
+	// 使用 Envoy 原生 API 进行注册
 	http.RegisterHttpFilterFactoryAndConfigParser(
-		"fm",
-		filtermanager.FilterManagerFactory,
-		&filtermanager.FilterManagerConfigParser{},
+		filter.Name,
+		filter.Factory,
+		filter.NewConfigParser(),
 	)
 }
 

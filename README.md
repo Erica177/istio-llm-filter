@@ -1,6 +1,13 @@
 # istio-llm-filter
 
-Envoy Golang Filter 插件，为 Istio 提供 LLM 请求的智能负载均衡能力。
+基于 Envoy Golang Filter 的 LLM 推理负载均衡插件，为 Istio 提供智能的大模型请求调度能力。
+
+## 技术基础
+
+本插件直接使用 [Envoy Golang Filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/golang_filter) 原生 API 开发：
+
+- `github.com/envoyproxy/envoy/contrib/golang/common/go/api` - Filter 接口定义
+- `github.com/envoyproxy/envoy/contrib/golang/filters/http/source/go/pkg/http` - Filter 注册
 
 ## 功能特性
 
@@ -15,19 +22,16 @@ Envoy Golang Filter 插件，为 Istio 提供 LLM 请求的智能负载均衡能
 ### 依赖
 
 - Go 1.22+
-- Envoy with Golang Filter support
-- Metadata-Center 服务（可选）
+- Envoy 1.32+ (with Golang Filter support)
+- Metadata-Center 服务（可选，启用负载感知和缓存感知需要）
 
 ### 编译
 
 ```bash
-# 下载依赖
-make deps
-
 # 编译 .so 共享库 (Linux AMD64)
 make build
 
-# 本地架构编译
+# 本地架构编译（开发测试用）
 make build-local
 
 # 验证编译
@@ -38,7 +42,7 @@ make verify
 
 ### 部署
 
-1. 将 `libllmproxy.so` 复制到 Envoy Sidecar 可访问的路径
+1. 将 `libllmproxy.so` 挂载到 Istio Gateway 容器
 2. 配置 EnvoyFilter 加载插件
 3. （可选）部署 Metadata-Center 服务
 
@@ -89,28 +93,61 @@ Score = W1 × CacheRatio - W2 × NormalizedRequestLoad - W3 × NormalizedPrefill
 - `NormalizedPrefillLoad`: 归一化的 Prefill 队列深度
 - `W1, W2, W3`: 可配置的权重参数
 
-默认权重: W1=2, W2=1, W3=3（优先考虑 Prefill 队列）
+默认权重: W1=2, W2=1, W3=3（优先避免 Prefill 队列过载）
 
 ## 配置示例
 
 ```yaml
-config:
-  model_mapping_rule:
-    - model_name: "qwen-plus"
-      rules:
-        - headers:
-            - name: "x-env"
-              exact_match: "prod"
-          subsets:
-            - cluster: "outbound|8080||qwen-prod.default.svc.cluster.local"
-  lb_mapping_rule:
-    - model_name: "qwen-plus"
-      lb_config:
-        - lb_type: "inference_lb"
-          cache_ratio_weight: 2
-          request_load_weight: 1
-          prefill_load_weight: 3
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: llm-proxy-filter
+  namespace: istio-system
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: "envoy.filters.http.router"
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.golang
+          typed_config:
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.golang.v3alpha.Config"
+            library_id: llm-proxy
+            library_path: /etc/envoy/libllmproxy.so
+            plugin_name: llm-proxy
+            plugin_config:
+              "@type": "type.googleapis.com/xds.type.v3.TypedStruct"
+              value:
+                protocol: openai
+                algorithm: inference_lb
+                model_mapping_rule:
+                  qwen-2.5-72b:
+                    rules:
+                      - scene_name: qwen-2.5-72b
+                        cluster: "outbound|8000||qwen-service.llm.svc.cluster.local"
+                        backend: vllm
+                lb_mapping_rule:
+                  qwen-2.5-72b:
+                    load_aware_enable: true
+                    cache_aware_enable: true
+                    candidate_percent: 10
+                    request_load_weight: 1
+                    prefill_load_weight: 3
+                    cache_radio_weight: 2
 ```
+
+完整配置示例参见 [examples/envoyfilter.yaml](examples/envoyfilter.yaml)。
 
 ## 环境变量
 
@@ -118,8 +155,9 @@ config:
 |------|------|--------|
 | `METADATA_CENTER_HOST` | Metadata-Center 地址 | localhost |
 | `METADATA_CENTER_PORT` | Metadata-Center 端口 | 8080 |
-| `METADATA_CENTER_ENABLED` | 是否启用 | false |
-| `METADATA_CENTER_CACHE_ENABLED` | 是否启用缓存功能 | false |
+| `METADATA_CENTER_ENABLED` | 是否启用负载感知 | false |
+| `METADATA_CENTER_CACHE_ENABLED` | 是否启用缓存感知 | false |
+| `METADATA_CENTER_TIMEOUT_MS` | 同步查询超时 (ms) | 100 |
 
 ## 开发
 
@@ -129,13 +167,30 @@ make fmt
 
 # 代码检查
 make lint
+make vet
 
 # 运行测试
 make test
 
-# 测试覆盖率
-make test-coverage
+# 清理构建产物
+make clean
 ```
+
+## 版本兼容性
+
+| 组件 | 版本 |
+|------|------|
+| Go | 1.22+ |
+| Envoy | 1.32.x |
+| Istio | 1.20+ |
+
+**重要**: Go 插件 SDK 版本必须与 Envoy 版本匹配。
+
+## 参考文档
+
+- [Envoy Golang Filter 文档](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/golang_filter)
+- [Envoy Golang Filter Proto](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/golang/v3alpha/golang.proto)
+- [Istio EnvoyFilter 配置](https://istio.io/latest/docs/reference/config/networking/envoy-filter/)
 
 ## License
 
