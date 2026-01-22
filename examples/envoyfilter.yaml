@@ -1,0 +1,95 @@
+# Istio LLM Filter EnvoyFilter 配置示例
+# 将此配置应用到 istio-system 命名空间
+
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: llm-proxy-filter
+  namespace: istio-system
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+    # 注入 Golang HTTP Filter
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: "envoy.filters.http.router"
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.golang
+          typed_config:
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.golang.v3alpha.Config"
+            library_id: llm-proxy
+            library_path: /usr/local/envoy/libllmproxy.so
+            plugin_name: llm-proxy
+            plugin_config:
+              "@type": "type.googleapis.com/xds.type.v3.TypedStruct"
+              value:
+                # 输入协议类型
+                protocol: openai
+                # 负载均衡算法
+                algorithm: inference_lb
+                
+                # 模型路由规则
+                model_mapping_rule:
+                  # 模型名称 -> 路由规则
+                  qwen-2.5-72b:
+                    rules:
+                      - scene_name: qwen-2.5-72b
+                        cluster: "outbound|8000||qwen-service"
+                        backend: vllm
+                  
+                  qwen-2.5-7b:
+                    rules:
+                      - scene_name: qwen-2.5-7b
+                        cluster: "outbound|8000||qwen-small-service"
+                        backend: vllm
+                  
+                  # 多路由规则示例（基于请求头匹配）
+                  gpt-4:
+                    rules:
+                      # 生产环境路由
+                      - scene_name: gpt-4-prod
+                        cluster: "outbound|8000||gpt4-prod-service"
+                        backend: vllm
+                        headers:
+                          - key: x-env
+                            value: prod
+                      # 测试环境路由（默认）
+                      - scene_name: gpt-4-test
+                        cluster: "outbound|8000||gpt4-test-service"
+                        backend: vllm
+                
+                # 负载均衡配置
+                lb_mapping_rule:
+                  qwen-2.5-72b:
+                    load_aware_enable: true      # 启用负载感知
+                    cache_aware_enable: true     # 启用缓存感知
+                    candidate_percent: 10        # 候选集百分比
+                    request_load_weight: 1       # 请求负载权重
+                    prefill_load_weight: 3       # Prefill 负载权重
+                    cache_ratio_weight: 2        # 缓存命中权重
+                  
+                  qwen-2.5-7b:
+                    load_aware_enable: true
+                    cache_aware_enable: false    # 小模型禁用缓存感知
+                    candidate_percent: 20
+                    request_load_weight: 1
+                    prefill_load_weight: 2
+                    cache_ratio_weight: 0
+                  
+                  gpt-4:
+                    load_aware_enable: true
+                    cache_aware_enable: true
+                    candidate_percent: 5
+                    request_load_weight: 1
+                    prefill_load_weight: 3
+                    cache_ratio_weight: 2
